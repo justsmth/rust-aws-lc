@@ -449,7 +449,6 @@ fn test_alpn_server_advertise_multiple() {
 #[test]
 fn test_alpn_server_select_none_fatal() {
     let mut server = Server::builder();
-    // NOTE: in AWS-LC all alpn errors are treated as SSL_TLSEXT_ERR_NOACK
     server.ctx().set_alpn_select_callback(|_, client| {
         ssl::select_next_proto(b"\x08http/1.1\x08spdy/3.1", client).ok_or(ssl::AlpnError::NOACK)
     });
