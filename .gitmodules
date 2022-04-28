@@ -1,7 +1,7 @@
-[submodule "boring-sys/deps/boringssl"]
-	path = boring-sys/deps/boringssl
-	url = https://github.com/google/boringssl.git
-	ignore = dirty
-[submodule "boring-sys/deps/boringssl-fips"]
-	path = boring-sys/deps/boringssl-fips
-	url = https://github.com/google/boringssl.git
+[submodule "boring-sys/deps/aws-lc"]
+	path = aws-lc-sys/deps/aws-lc
+	url = https://github.com/awslabs/aws-lc.git
+[submodule "aws-lc-sys/deps/aws-lc-fips"]
+	path = aws-lc-sys/deps/aws-lc-fips
+	url = https://github.com/awslabs/aws-lc.git
+	branch = fips-2021-10-20

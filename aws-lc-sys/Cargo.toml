@@ -1,0 +1,36 @@
+[package]
+name = "aws-lc-sys"
+version = "2.0.0"
+authors = ["Alex Crichton <alex@alexcrichton.com>",
+           "Steven Fackler <sfackler@gmail.com>",
+           "Ivan Nikulin <ifaaan@gmail.com>",
+           "Justin Smith <justsmth@amazon.com>"]
+license = "MIT"
+description = "FFI bindings to AWS-LC"
+repository = "https://github.com/justsmth/rust-aws-lc/"
+documentation = "https://docs.rs/aws-lc-sys"
+links = "aws-lc"
+readme = "README.md"
+categories = ["cryptography", "external-ffi-bindings"]
+edition = "2018"
+include = [
+    "/*.md",
+    "/*.toml",
+    "/LICENSE-MIT",
+    "/deps/**/*.[chS]",
+    "/deps/**/*.asm",
+    "/deps/**/*.cc",
+    "/deps/**/CMakeLists.txt",
+    "/deps/**/sources.cmake",
+    "/deps/aws-lc/LICENSE",
+    "/build.rs",
+    "/src",
+]
+
+[build-dependencies]
+bindgen = { version = "0.59", default-features = false, features = ["runtime"] }
+cmake = "0.1"
+
+[features]
+# Use a FIPS-validated version of aws-lc.
+fips = []

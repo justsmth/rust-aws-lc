@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "boring",
-    "boring-sys",
-    "tokio-boring",
-    "hyper-boring"
+    "aws-lc",
+    "aws-lc-sys",
+    "tokio-aws-lc",
+    "hyper-aws-lc"
 ]

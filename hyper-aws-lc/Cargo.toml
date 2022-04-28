@@ -1,0 +1,33 @@
+[package]
+name = "hyper-aws-lc"
+version = "2.1.1"
+authors = ["Steven Fackler <sfackler@gmail.com>", "Ivan Nikulin <ifaaan@gmail.com>"]
+edition = "2018"
+description = "Hyper TLS support via AWS-LC"
+license = "MIT/Apache-2.0"
+repository = "https://github.com/justsmth/rust-aws-lc"
+documentation = "https://docs.rs/hyper-aws-lc"
+readme = "README.md"
+exclude = ["test/*"]
+
+[features]
+default = ["runtime"]
+
+runtime = ["hyper/runtime"]
+fips = ["tokio-aws-lc/fips"]
+
+[dependencies]
+antidote = "1.0.0"
+http = "0.2"
+hyper = { version = "0.14", default-features = false, features = ["client"] }
+linked_hash_set = "0.1"
+once_cell = "1.0"
+aws-lc = { version = ">=1.1.0,<3.0.0", path = "../aws-lc" }
+tokio = "1"
+tokio-aws-lc = { version = "2", path = "../tokio-aws-lc" }
+tower-layer = "0.3"
+
+[dev-dependencies]
+hyper = { version = "0.14", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"

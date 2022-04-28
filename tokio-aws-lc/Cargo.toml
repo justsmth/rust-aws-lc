@@ -1,0 +1,25 @@
+[package]
+name = "tokio-aws-lc"
+version = "2.1.4"
+authors = ["Alex Crichton <alex@alexcrichton.com>", "Ivan Nikulin <ifaaan@gmail.com>", "Justin Smith <justsmth@amazon.com>"]
+license = "MIT/Apache-2.0"
+edition = "2018"
+repository = "https://github.com/justsmth/rust-aws-lc"
+homepage = "https://github.com/justsmth/rust-aws-lc"
+documentation = "https://docs.rs/tokio-aws-lc"
+description = """
+An implementation of SSL streams for Tokio backed by AWS-LC
+"""
+
+[dependencies]
+aws-lc = { version = ">=1.1.0,<3.0.0", path = "../aws-lc" }
+aws-lc-sys = { version = ">=1.1.0,<3.0.0", path = "../aws-lc-sys" }
+tokio = "1"
+
+[dev-dependencies]
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+
+[features]
+fips = ["aws-lc/fips"]

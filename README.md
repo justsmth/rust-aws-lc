@@ -1,38 +1,26 @@
-# boring
+# aws-lc
 
-[![crates.io](https://img.shields.io/crates/v/boring.svg)](https://crates.io/crates/boring)
+[![crates.io](https://img.shields.io/crates/v/aws-lc.svg)](https://crates.io/crates/aws-lc)
 
-BoringSSL bindings for the Rust programming language and TLS adapters for [tokio](https://github.com/tokio-rs/tokio)
+AWS-LC bindings for the Rust programming language and TLS adapters for [tokio](https://github.com/tokio-rs/tokio)
 and [hyper](https://github.com/hyperium/hyper) built on top of it.
 
-[Documentation](https://docs.rs/boring).
+[Documentation](https://docs.rs/aws-lc).
 
 ## Release Support
 
-By default, the crate statically links with the latest BoringSSL master branch.
+By default, the crate statically links with the latest AWS-LC master branch.
 
 ## Support for pre-built binaries
 
-While this crate can build BoringSSL on its own, you may want to provide pre-built binaries instead.
-To do so, specify the environment variable `BORING_BSSL_PATH` with the path to the binaries.
+While this crate can build AWS-LC on its own, you may want to provide pre-built binaries instead.
+To do so, specify the environment variable `AWS_LC_BIN_PATH` with the path to the binaries.
 
-You can also provide specific headers by setting `BORING_BSSL_INCLUDE_PATH`.
+You can also provide specific headers by setting `AWS_LC_INCLUDE_PATH`.
 
-_Notes_: The crate will look for headers in the `$BORING_BSSL_INCLUDE_PATH/openssl/` folder, make sure to place your headers there.
+_Notes_: The crate will look for headers in the `$AWS_LC_INCLUDE_PATH` folder, make sure to place your headers there.
 
-_Warning_: When providing a different version of BoringSSL make sure to use a compatible one, the crate relies on the presence of certain functions.
-
-## Building with a FIPS-validated module
-
-Only BoringCrypto module version ae223d6138807a13006342edfeef32e813246b39, as
-certified with [certificate
-3678](https://csrc.nist.gov/projects/cryptographic-module-validation-program/certificate/3678)
-is supported by this crate. Support is enabled by this crate's `fips` feature.
-
-`boring-sys` comes with a test that FIPS is enabled/disabled depending on the feature flag. You can run it as follows:
-```bash
-$ cargo test --features fips fips::is_enabled
-```
+_Warning_: When providing a different version of AWS-LC make sure to use a compatible one, the crate relies on the presence of certain functions.
 
 ## Contribution
 
@@ -43,4 +31,4 @@ Version 2.0 and the MIT license without any additional terms or conditions.
 
 ## Accolades
 
-The project is based on a fork of [rust-openssl](https://github.com/sfackler/rust-openssl).
+The project is based on a fork of [boring](https://github.com/cloudflare/boring), which is a fork of [rust-openssl](https://github.com/sfackler/rust-openssl).
