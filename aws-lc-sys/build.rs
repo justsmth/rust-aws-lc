@@ -257,6 +257,7 @@ fn main() {
         }
         if cfg!(feature = "fips") {
             let (clang, clangxx) = verify_fips_clang_version();
+            cfg.define("BUILD_SHARED_LIBS", "TRUE");
             cfg.define("CMAKE_C_COMPILER", clang);
             cfg.define("CMAKE_CXX_COMPILER", clangxx);
             cfg.define("CMAKE_ASM_COMPILER", clang);
@@ -276,8 +277,13 @@ fn main() {
         bssl_dir, build_path
     );
 
-    println!("cargo:rustc-link-lib=static=crypto");
-    println!("cargo:rustc-link-lib=static=ssl");
+    if cfg!(feature = "fips") {
+        println!("cargo:rustc-link-lib=dylib=crypto");
+        println!("cargo:rustc-link-lib=dylib=ssl");
+    } else {
+        println!("cargo:rustc-link-lib=static=crypto");
+        println!("cargo:rustc-link-lib=static=ssl");
+    }
 
     // MacOS: Allow cdylib to link with undefined symbols
     if cfg!(target_os = "macos") {

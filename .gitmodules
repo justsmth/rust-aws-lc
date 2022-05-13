@@ -3,5 +3,5 @@
 	url = https://github.com/awslabs/aws-lc.git
 [submodule "aws-lc-sys/deps/aws-lc-fips"]
 	path = aws-lc-sys/deps/aws-lc-fips
-	url = https://github.com/awslabs/aws-lc.git
-	branch = fips-2021-10-20
+	url = https://github.com/justsmth/aws-lc.git
+	branch = fips-rust
