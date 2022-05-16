@@ -230,10 +230,26 @@ fn verify_fips_clang_version() -> (&'static str, &'static str) {
 fn main() {
     use std::env;
 
+    // Default to static build only on Mac
+    let mut build_static = cfg!(target_os = "macos");
+    let mut build_fips = false;
+
+    if cfg!(feature = "fips") {
+        if cfg!(target_os = "macos") {
+            panic!("FIPS is not currently supported on MacOS");
+        }
+        build_fips = true;
+        build_static = false;
+    } else if cfg!(feature = "dynamic") {
+        build_static = false;
+    } else if cfg!(feature = "static") {
+        build_static = true;
+    }
+
     println!("cargo:rerun-if-env-changed=AWS_LC_BIN_PATH");
     let bssl_dir = std::env::var("AWS_LC_BIN_PATH").unwrap_or_else(|_| {
         if !Path::new(AWS_LC_PATH).join("CMakeLists.txt").exists() {
-            println!("cargo:warning=fetching boringssl git submodule");
+            println!("cargo:warning=fetching aws-lc git submodule");
             // fetch the boringssl submodule
             let status = Command::new("git")
                 .args(&[
@@ -251,17 +267,15 @@ fn main() {
 
         let mut cfg = get_boringssl_cmake_config();
 
-        if cfg!(feature = "fuzzing") {
-            cfg.cxxflag("-DBORINGSSL_UNSAFE_DETERMINISTIC_MODE")
-                .cxxflag("-DBORINGSSL_UNSAFE_FUZZER_MODE");
-        }
-        if cfg!(feature = "fips") {
+        if build_fips {
             let (clang, clangxx) = verify_fips_clang_version();
-            cfg.define("BUILD_SHARED_LIBS", "TRUE");
             cfg.define("CMAKE_C_COMPILER", clang);
             cfg.define("CMAKE_CXX_COMPILER", clangxx);
             cfg.define("CMAKE_ASM_COMPILER", clang);
             cfg.define("FIPS", "1");
+        }
+        if !build_static {
+            cfg.define("BUILD_SHARED_LIBS", "TRUE");
         }
 
         cfg.build_target("ssl").build().display().to_string()
@@ -277,17 +291,12 @@ fn main() {
         bssl_dir, build_path
     );
 
-    if cfg!(feature = "fips") {
-        println!("cargo:rustc-link-lib=dylib=crypto");
-        println!("cargo:rustc-link-lib=dylib=ssl");
-    } else {
+    if build_static {
         println!("cargo:rustc-link-lib=static=crypto");
         println!("cargo:rustc-link-lib=static=ssl");
-    }
-
-    // MacOS: Allow cdylib to link with undefined symbols
-    if cfg!(target_os = "macos") {
-        println!("cargo:rustc-cdylib-link-arg=-Wl,-undefined,dynamic_lookup");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=crypto");
+        println!("cargo:rustc-link-lib=dylib=ssl");
     }
 
     println!("cargo:rerun-if-env-changed=AWS_LC_INCLUDE_PATH");

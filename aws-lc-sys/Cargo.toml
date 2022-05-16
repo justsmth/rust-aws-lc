@@ -34,3 +34,5 @@ cmake = { git = "https://github.com/rust-lang/cmake-rs" }
 [features]
 # Use a FIPS-validated version of aws-lc.
 fips = []
+static = []
+dynamic = []
