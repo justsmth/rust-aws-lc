@@ -426,9 +426,15 @@ impl OutputLib {
     }
 
     fn locate(&self, path: &PathBuf, lib_type: OutputLibType) -> PathBuf {
-        path.join(Path::new("build/crypto"))
-            .join(get_boringssl_platform_output_path())
-            .join(Path::new(&self.libname(lib_type)))
+        path.join(Path::new(&format!(
+            "build/{}",
+            match self {
+                CRYPTO => "crypto",
+                _ => "ssl",
+            }
+        )))
+        .join(get_boringssl_platform_output_path())
+        .join(Path::new(&self.libname(lib_type)))
     }
 }
 
@@ -443,18 +449,17 @@ fn main() {
     println!("cargo:rerun-if-env-changed=AWS_LC_BIN_PATH");
     let mut bssl_dir = PathBuf::from(env::var("AWS_LC_BIN_PATH").unwrap_or_else(|_| {
         let mut cmake_cfg = prepare_cmake_build(build_config.fips, build_config.lib_type, None);
+
+        cmake_cfg.build_target("clean").build();
         let mut output_dir = cmake_cfg.build_target("ssl").build();
 
-        let libcrypto_path = output_dir
-            .join(Path::new("build/crypto"))
-            .join(get_boringssl_platform_output_path())
-            .join(Path::new("libcrypto.a"));
+        let libcrypto_path = CRYPTO.locate(&output_dir, build_config.lib_type);
 
         let mut symbols = HashSet::new();
         parse_static_symbols(&libcrypto_path, &mut symbols);
         eprintln!("Count: {}", symbols.len());
         let symbol_path = output_dir.join(Path::new("symbols.txt"));
-        write_symbol_file(&symbol_path, symbols).unwrap();
+        write_symbol_file(&symbol_path, symbols);
 
         if build_config.prefix {
             cmake_cfg.build_target("clean").build();
@@ -470,18 +475,17 @@ fn main() {
     }));
     eprintln!("OUTPUT DIR: {}", bssl_dir.to_str().unwrap());
 
+    let mut libcrypto_path = CRYPTO.locate(&bssl_dir, build_config.lib_type);
+    libcrypto_path.pop();
+    let mut libssl_path = SSL.locate(&bssl_dir, build_config.lib_type);
+    libssl_path.pop();
     println!(
         "cargo:rustc-link-search=native={}",
-        CRYPTO
-            .locate(&bssl_dir, build_config.lib_type)
-            .display()
-            .to_string()
+        libcrypto_path.display().to_string()
     );
     println!(
         "cargo:rustc-link-search=native={}",
-        SSL.locate(&bssl_dir, build_config.lib_type)
-            .display()
-            .to_string()
+        libssl_path.display().to_string()
     );
 
     match build_config.lib_type {
