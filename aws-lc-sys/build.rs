@@ -1,3 +1,12 @@
+use crate::OutputLib::{CRYPTO, SSL};
+use crate::OutputLibType::{DYNAMIC, STATIC};
+use cmake::Config;
+use macho::{MachObject, SymTabType, SymTabTypeMask, SymbolTableEntry};
+use std::collections::HashSet;
+use std::convert::TryInto;
+use std::env;
+use std::fs::File;
+use std::io::{Cursor, Error, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -55,7 +64,7 @@ const CMAKE_PARAMS_IOS: &[(&str, &[(&str, &str)])] = &[
 /// MSVC generator on Windows place static libs in a target sub-folder,
 /// so adjust library location based on platform and build target.
 /// See issue: https://github.com/alexcrichton/cmake-rs/issues/18
-fn get_boringssl_platform_output_path() -> String {
+fn get_boringssl_platform_output_path() -> PathBuf {
     if cfg!(windows) {
         // Code under this branch should match the logic in cmake-rs
         let debug_env_var = std::env::var("DEBUG").expect("DEBUG variable not defined in env");
@@ -82,9 +91,9 @@ fn get_boringssl_platform_output_path() -> String {
             unknown => panic!("Unknown OPT_LEVEL={} env var.", unknown),
         };
 
-        subdir.to_string()
+        PathBuf::from(subdir)
     } else {
-        "".to_string()
+        PathBuf::new()
     }
 }
 
@@ -227,81 +236,282 @@ fn verify_fips_clang_version() -> (&'static str, &'static str) {
     unreachable!()
 }
 
+struct BuildConfig {
+    link_from: Option<PathBuf>,
+    prefix: bool,
+    fips: bool,
+    lib_type: OutputLibType,
+}
+
+impl BuildConfig {
+    fn create() -> Self {
+        let link_from = match env::var("AWS_LC_BIN_PATH") {
+            Ok(path) => Some(PathBuf::from(path)),
+            _ => None,
+        };
+        // Default to static build only on Mac
+        let mut lib_type = if cfg!(target_os = "macos") {
+            STATIC
+        } else {
+            DYNAMIC
+        };
+        let mut fips = false;
+        let prefix = true;
+
+        if cfg!(feature = "fips") {
+            if cfg!(target_os = "macos") {
+                panic!("FIPS is not currently supported on MacOS");
+            }
+            fips = true;
+            lib_type = DYNAMIC;
+        } else if cfg!(feature = "dynamic") {
+            lib_type = DYNAMIC;
+        } else if cfg!(feature = "static") {
+            lib_type = STATIC;
+        }
+
+        BuildConfig {
+            link_from,
+            prefix,
+            fips,
+            lib_type,
+        }
+    }
+}
+
+fn prepare_cmake_build(
+    build_fips: bool,
+    lib_type: OutputLibType,
+    build_prefix: Option<(&str, &Path)>,
+) -> Config {
+    if !Path::new(AWS_LC_PATH).join("CMakeLists.txt").exists() {
+        println!("cargo:warning=fetching aws-lc git submodule");
+        // fetch the boringssl submodule
+        let status = Command::new("git")
+            .args(&["submodule", "update", "--init", "--recursive", AWS_LC_PATH])
+            .status();
+        if !status.map_or(false, |status| status.success()) {
+            panic!("failed to fetch submodule - consider running `git submodule update --init --recursive deps/boringssl` yourself");
+        }
+    }
+
+    let mut cfg = get_boringssl_cmake_config();
+
+    if build_fips {
+        let (clang, clangxx) = verify_fips_clang_version();
+        cfg.define("CMAKE_C_COMPILER", clang);
+        cfg.define("CMAKE_CXX_COMPILER", clangxx);
+        cfg.define("CMAKE_ASM_COMPILER", clang);
+        cfg.define("FIPS", "1");
+    }
+    match lib_type {
+        DYNAMIC => {
+            cfg.define("BUILD_SHARED_LIBS", "TRUE");
+        }
+        _ => {}
+    }
+    if let Some((symbol_prefix, symbol_file_path)) = build_prefix {
+        cfg.define("BORINGSSL_PREFIX", symbol_prefix);
+        cfg.define(
+            "BORINGSSL_PREFIX_SYMBOLS",
+            symbol_file_path.display().to_string(),
+        );
+    }
+
+    cfg
+}
+
+trait LinkerSymbol {
+    fn is_public(&self, lib_type: OutputLibType) -> bool;
+}
+
+impl LinkerSymbol for SymbolTableEntry {
+    fn is_public(&self, lib_type: OutputLibType) -> bool {
+        (self.n_type & SymTabTypeMask::N_TYPE as u8) != SymTabType::N_UNDF as u8
+            && (self.n_type & SymTabTypeMask::N_EXT as u8) != 0
+            && (lib_type == OutputLibType::STATIC
+                || (self.n_type & SymTabTypeMask::N_PEXT as u8) == 0)
+    }
+}
+
+fn parse_mach_o_object(
+    bytes: &[u8],
+    lib_type: OutputLibType,
+    symbols: &mut HashSet<String>,
+) -> Result<(), String> {
+    let mobject = MachObject::parse(bytes).map_err(|_| "Unable to parse object file.")?;
+    for symtab in mobject.symtab {
+        for entry in symtab.entries {
+            //println!("Symbol: {}", entry.symbol);
+            if entry.is_public(lib_type) {
+                if let Some("_") = entry.symbol.get(0..1) {
+                    symbols.insert(String::from(entry.symbol.get(1..).unwrap()));
+                } else {
+                    return Err(format!(
+                        "Unexpected symbol without underscore prefix: {}",
+                        entry.symbol
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_static_symbols(path: &PathBuf, symbols: &mut HashSet<String>) -> Result<(), String> {
+    use ar::Archive;
+    use std::fs::File;
+    use std::io;
+    use std::str;
+
+    let mut archive = Archive::new(File::open(path).unwrap());
+    while let Some(entry_result) = archive.next_entry() {
+        let mut entry = entry_result.unwrap();
+        let name = String::from_utf8_lossy(entry.header().identifier());
+        //eprintln!("Entry: {}", name);
+        entry.header().size();
+
+        let mut buffer = Vec::new();
+        entry.read_to_end(&mut buffer).unwrap();
+        parse_mach_o_object(&buffer, STATIC, symbols)?;
+    }
+    Ok(())
+}
+
+fn write_symbol_file(path: &PathBuf, symbols: HashSet<String>) -> Result<usize, Error> {
+    let mut counter = 0usize;
+    let mut file = File::create(path)?;
+    let mut symbol_list: Vec<String> = symbols.into_iter().collect();
+    symbol_list.sort();
+    for symbol in symbol_list {
+        file.write(symbol.as_bytes())?;
+        file.write("\n".as_bytes())?;
+        counter += 1;
+    }
+    Ok(counter)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputLib {
+    CRYPTO,
+    SSL,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputLibType {
+    STATIC,
+    DYNAMIC,
+}
+
+impl OutputLibType {
+    fn file_extension(&self) -> &str {
+        match self {
+            STATIC => "a",
+            _ => "so",
+        }
+    }
+}
+
+impl OutputLib {
+    fn libname(&self, libtype: OutputLibType) -> String {
+        match self {
+            CRYPTO => {
+                format!("libcrypto.{}", libtype.file_extension())
+            }
+            _ => {
+                format!("libssl.{}", libtype.file_extension())
+            }
+        }
+    }
+
+    fn locate(&self, path: &PathBuf, lib_type: OutputLibType) -> PathBuf {
+        path.join(Path::new("build/crypto"))
+            .join(get_boringssl_platform_output_path())
+            .join(Path::new(&self.libname(lib_type)))
+    }
+}
+
+//TODO:
+const AWS_LC_PREFIX_VALUE: &str = "aws_lc_1_1_0";
+
 fn main() {
     use std::env;
 
-    // Default to static build only on Mac
-    let mut build_static = cfg!(target_os = "macos");
-    let mut build_fips = false;
-
-    if cfg!(feature = "fips") {
-        if cfg!(target_os = "macos") {
-            panic!("FIPS is not currently supported on MacOS");
-        }
-        build_fips = true;
-        build_static = false;
-    } else if cfg!(feature = "dynamic") {
-        build_static = false;
-    } else if cfg!(feature = "static") {
-        build_static = true;
-    }
+    let build_config = BuildConfig::create();
 
     println!("cargo:rerun-if-env-changed=AWS_LC_BIN_PATH");
-    let bssl_dir = std::env::var("AWS_LC_BIN_PATH").unwrap_or_else(|_| {
-        if !Path::new(AWS_LC_PATH).join("CMakeLists.txt").exists() {
-            println!("cargo:warning=fetching aws-lc git submodule");
-            // fetch the boringssl submodule
-            let status = Command::new("git")
-                .args(&[
-                    "submodule",
-                    "update",
-                    "--init",
-                    "--recursive",
-                    AWS_LC_PATH,
-                ])
-                .status();
-            if !status.map_or(false, |status| status.success()) {
-                panic!("failed to fetch submodule - consider running `git submodule update --init --recursive deps/boringssl` yourself");
-            }
+    let mut bssl_dir = PathBuf::from(env::var("AWS_LC_BIN_PATH").unwrap_or_else(|_| {
+        let mut cmake_cfg = prepare_cmake_build(build_config.fips, build_config.lib_type, None);
+        let mut output_dir = cmake_cfg.build_target("ssl").build();
+
+        let libcrypto_path = output_dir
+            .join(Path::new("build/crypto"))
+            .join(get_boringssl_platform_output_path())
+            .join(Path::new("libcrypto.a"));
+
+        let mut symbols = HashSet::new();
+        parse_static_symbols(&libcrypto_path, &mut symbols);
+        eprintln!("Count: {}", symbols.len());
+        let symbol_path = output_dir.join(Path::new("symbols.txt"));
+        write_symbol_file(&symbol_path, symbols).unwrap();
+
+        if build_config.prefix {
+            cmake_cfg.build_target("clean").build();
+            let mut cmake_cfg = prepare_cmake_build(
+                build_config.fips,
+                build_config.lib_type,
+                Some((AWS_LC_PREFIX_VALUE, &symbol_path)),
+            );
+            output_dir = cmake_cfg.build_target("ssl").build();
         }
 
-        let mut cfg = get_boringssl_cmake_config();
+        output_dir.display().to_string()
+    }));
+    eprintln!("OUTPUT DIR: {}", bssl_dir.to_str().unwrap());
 
-        if build_fips {
-            let (clang, clangxx) = verify_fips_clang_version();
-            cfg.define("CMAKE_C_COMPILER", clang);
-            cfg.define("CMAKE_CXX_COMPILER", clangxx);
-            cfg.define("CMAKE_ASM_COMPILER", clang);
-            cfg.define("FIPS", "1");
-        }
-        if !build_static {
-            cfg.define("BUILD_SHARED_LIBS", "TRUE");
-        }
-
-        cfg.build_target("ssl").build().display().to_string()
-    });
-
-    let build_path = get_boringssl_platform_output_path();
     println!(
-        "cargo:rustc-link-search=native={}/build/crypto/{}",
-        bssl_dir, build_path
+        "cargo:rustc-link-search=native={}",
+        CRYPTO
+            .locate(&bssl_dir, build_config.lib_type)
+            .display()
+            .to_string()
     );
     println!(
-        "cargo:rustc-link-search=native={}/build/ssl/{}",
-        bssl_dir, build_path
+        "cargo:rustc-link-search=native={}",
+        SSL.locate(&bssl_dir, build_config.lib_type)
+            .display()
+            .to_string()
     );
 
-    if build_static {
-        println!("cargo:rustc-link-lib=static=crypto");
-        println!("cargo:rustc-link-lib=static=ssl");
-    } else {
-        println!("cargo:rustc-link-lib=dylib=crypto");
-        println!("cargo:rustc-link-lib=dylib=ssl");
+    match build_config.lib_type {
+        DYNAMIC => {
+            println!("cargo:rustc-link-lib=dylib=crypto");
+            println!("cargo:rustc-link-lib=dylib=ssl");
+        }
+        STATIC => {
+            println!("cargo:rustc-link-lib=static=crypto");
+            println!("cargo:rustc-link-lib=static=ssl");
+        }
     }
 
+    //panic!("Stop here");
     println!("cargo:rerun-if-env-changed=AWS_LC_INCLUDE_PATH");
     let include_path =
         std::env::var("AWS_LC_INCLUDE_PATH").unwrap_or_else(|_| format!("{}/include", AWS_LC_PATH));
+
+    let mut clang_args = Vec::new();
+    clang_args.push("-I");
+    clang_args.push(&include_path);
+    let boring_prefix_param = &format!("-DBORINGSSL_PREFIX={}", AWS_LC_PREFIX_VALUE);
+    clang_args.push(&boring_prefix_param);
+    clang_args.push("-I");
+    let symbol_include_dir = bssl_dir
+        .join("build")
+        .join("symbol_prefix_include")
+        .display()
+        .to_string();
+    clang_args.push(&symbol_include_dir);
 
     let mut builder = bindgen::Builder::default()
         .derive_copy(true)
@@ -316,51 +526,12 @@ fn main() {
         .layout_tests(true)
         .prepend_enum_name(true)
         .rustfmt_bindings(true)
-        .clang_args(&["-I", &include_path]);
+        //.ctypes_prefix(AWS_LC_PREFIX_VALUE)
+        .clang_args(&clang_args);
 
-    let headers = [
-        "aes.h",
-        "asn1.h",
-        "asn1_mac.h",
-        "asn1t.h",
-        "blake2.h",
-        "blowfish.h",
-        "cast.h",
-        "chacha.h",
-        "cmac.h",
-        "cpu.h",
-        "curve25519.h",
-        "des.h",
-        "dtls1.h",
-        "hkdf.h",
-        "hrss.h",
-        "md4.h",
-        "md5.h",
-        "obj_mac.h",
-        "objects.h",
-        "opensslv.h",
-        "ossl_typ.h",
-        "pkcs12.h",
-        "poly1305.h",
-        "rand.h",
-        "rc4.h",
-        "ripemd.h",
-        "siphash.h",
-        "ssl.h",
-        "tls1.h",
-        "trust_token.h",
-        "x509.h",
-        "x509_vfy.h",
-        "x509v3.h",
-    ];
+    let headers = ["wrapper.h"];
     for header in &headers {
-        builder = builder.header(
-            Path::new(&include_path)
-                .join("openssl")
-                .join(header)
-                .to_str()
-                .unwrap(),
-        );
+        builder = builder.header("wrapper.h");
     }
 
     let bindings = builder.generate().expect("Unable to generate bindings");

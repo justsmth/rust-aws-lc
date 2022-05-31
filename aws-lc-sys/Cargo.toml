@@ -31,8 +31,13 @@ include = [
 bindgen = { version = "0.59", default-features = false, features = ["runtime"] }
 #cmake = "0.1"
 cmake = { git = "https://github.com/rust-lang/cmake-rs" }
+#macho = "0.4.1"
+macho = { git = "https://github.com/justsmth/macho-rs.git", branch = "parse-symbol-table" }
+ar = "0.9.0"
+
 [features]
 # Use a FIPS-validated version of aws-lc.
 fips = []
 static = []
 dynamic = []
+no-prefix = []
