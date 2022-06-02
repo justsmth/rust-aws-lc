@@ -2,7 +2,7 @@ use crate::ffi;
 use crate::ffi::BIO_new_mem_buf;
 use libc::c_int;
 use std::marker::PhantomData;
-use std::os::raw::{c_void, c_char, c_long};
+use std::os::raw::{c_char, c_long, c_void};
 use std::ptr;
 use std::slice;
 
@@ -69,8 +69,7 @@ impl MemBio {
         }
     }
 
-    fn BIO_get_mem_data(        bio: *mut ffi::BIO,
-                                contents: *mut *mut c_char) -> c_long {
+    fn BIO_get_mem_data(bio: *mut ffi::BIO, contents: *mut *mut c_char) -> c_long {
         let ctnt = contents as *mut c_void;
         unsafe {
             return ffi::BIO_ctrl(bio, ffi::BIO_CTRL_INFO, 0, ctnt) as c_long;

@@ -28,7 +28,8 @@ include = [
 ]
 
 [build-dependencies]
-bindgen = { version = "0.59", default-features = false, features = ["runtime"] }
+#bindgen = { version = "0.59", default-features = false, features = ["runtime"] }
+bindgen = { git="https://github.com/justsmth/rust-bindgen.git", branch = "link_name_override", features = ["runtime"] }
 #cmake = "0.1"
 cmake = { git = "https://github.com/rust-lang/cmake-rs" }
 #macho = "0.4.1"

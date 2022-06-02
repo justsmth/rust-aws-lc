@@ -1,14 +1,20 @@
 use crate::OutputLib::{CRYPTO, SSL};
 use crate::OutputLibType::{DYNAMIC, STATIC};
+use bindgen::callbacks::{
+    DeriveTrait, EnumVariantCustomBehavior, EnumVariantValue, IntKind, MacroParsingBehavior,
+};
 use cmake::Config;
 use macho::{MachObject, SymTabType, SymTabTypeMask, SymbolTableEntry};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::convert::TryInto;
 use std::env;
+use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io::{Cursor, Error, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 // NOTE: this build script is adopted from quiche (https://github.com/cloudflare/quiche)
 
@@ -369,7 +375,6 @@ fn parse_static_symbols(path: &PathBuf, symbols: &mut HashSet<String>) -> Result
     while let Some(entry_result) = archive.next_entry() {
         let mut entry = entry_result.unwrap();
         let name = String::from_utf8_lossy(entry.header().identifier());
-        //eprintln!("Entry: {}", name);
         entry.header().size();
 
         let mut buffer = Vec::new();
@@ -385,9 +390,11 @@ fn write_symbol_file(path: &PathBuf, symbols: HashSet<String>) -> Result<usize, 
     let mut symbol_list: Vec<String> = symbols.into_iter().collect();
     symbol_list.sort();
     for symbol in symbol_list {
-        file.write(symbol.as_bytes())?;
-        file.write("\n".as_bytes())?;
-        counter += 1;
+        if !symbol.contains("bignum") {
+            file.write(symbol.as_bytes())?;
+            file.write("\n".as_bytes())?;
+            counter += 1;
+        }
     }
     Ok(counter)
 }
@@ -408,38 +415,116 @@ impl OutputLibType {
     fn file_extension(&self) -> &str {
         match self {
             STATIC => "a",
-            _ => "so",
+            DYNAMIC => "so",
+        }
+    }
+    fn rust_lib_type(&self) -> &str {
+        match self {
+            STATIC => "static",
+            DYNAMIC => "dylib",
         }
     }
 }
 
 impl OutputLib {
-    fn libname(&self, libtype: OutputLibType) -> String {
+    fn libname(&self) -> &str {
         match self {
-            CRYPTO => {
-                format!("libcrypto.{}", libtype.file_extension())
-            }
-            _ => {
-                format!("libssl.{}", libtype.file_extension())
-            }
+            CRYPTO => "crypto",
+            SSL => "ssl",
         }
     }
 
     fn locate(&self, path: &PathBuf, lib_type: OutputLibType) -> PathBuf {
-        path.join(Path::new(&format!(
-            "build/{}",
-            match self {
-                CRYPTO => "crypto",
-                _ => "ssl",
-            }
-        )))
-        .join(get_boringssl_platform_output_path())
-        .join(Path::new(&self.libname(lib_type)))
+        path.join(Path::new(&format!("build/{}", self.libname())))
+            .join(get_boringssl_platform_output_path())
+            .join(Path::new(&format!(
+                "lib{}.{}",
+                self.libname(),
+                lib_type.file_extension()
+            )))
     }
 }
 
+fn build_aws_lc(build_config: &BuildConfig) -> PathBuf {
+    let mut cmake_cfg = prepare_cmake_build(build_config.fips, build_config.lib_type, None);
+
+    cmake_cfg.build_target("clean").build();
+    let mut output_dir = cmake_cfg.build_target("ssl").build();
+
+    if build_config.prefix {
+        let mut symbols = HashSet::new();
+
+        let libcrypto_path = CRYPTO.locate(&output_dir, build_config.lib_type);
+        parse_static_symbols(&libcrypto_path, &mut symbols);
+
+        let symbol_path = output_dir.join(Path::new("symbols.txt"));
+        write_symbol_file(&symbol_path, symbols);
+
+        cmake_cfg.build_target("clean").build();
+
+        let mut cmake_cfg = prepare_cmake_build(
+            build_config.fips,
+            build_config.lib_type,
+            Some((&prefix_string(), &symbol_path)),
+        );
+        output_dir = cmake_cfg.build_target("ssl").build();
+    }
+
+    output_dir
+}
+
 //TODO:
-const AWS_LC_PREFIX_VALUE: &str = "aws_lc_1_1_0";
+const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+fn prefix_string() -> String {
+    format!("aws_lc_{}", VERSION.to_string().replace(".", "_"))
+}
+
+fn prepare_clang_args(build_prefix: Option<(&str, &PathBuf)>) -> Vec<String> {
+    let mut clang_args: Vec<String> = Vec::new();
+    let include_path =
+        env::var("AWS_LC_INCLUDE_PATH").unwrap_or_else(|_| format!("{}/include", AWS_LC_PATH));
+
+    clang_args.push("-I".to_string());
+    clang_args.push(include_path);
+    if let Some((prefix, aws_lc_dir)) = build_prefix {
+        clang_args.push(format!("-DBORINGSSL_PREFIX={}", prefix));
+        clang_args.push("-I".to_string());
+        clang_args.push(
+            aws_lc_dir
+                .join("build")
+                .join("symbol_prefix_include")
+                .display()
+                .to_string(),
+        );
+    }
+
+    clang_args
+}
+
+#[derive(Debug)]
+struct SymbolCallback {
+    prefix: String,
+}
+
+impl SymbolCallback {
+    fn new() -> Self {
+        SymbolCallback {
+            prefix: format!("{}_", prefix_string()),
+        }
+    }
+}
+
+impl bindgen::callbacks::ParseCallbacks for SymbolCallback {
+    fn link_name_override(&self, function_name: &str) -> Option<String> {
+        let mut result = function_name.to_string();
+        if result.starts_with(&self.prefix) {
+            result = result.replace(&self.prefix, "");
+            Some(result)
+        } else {
+            None
+        }
+    }
+}
 
 fn main() {
     use std::env;
@@ -447,75 +532,42 @@ fn main() {
     let build_config = BuildConfig::create();
 
     println!("cargo:rerun-if-env-changed=AWS_LC_BIN_PATH");
-    let mut bssl_dir = PathBuf::from(env::var("AWS_LC_BIN_PATH").unwrap_or_else(|_| {
-        let mut cmake_cfg = prepare_cmake_build(build_config.fips, build_config.lib_type, None);
+    let mut aws_lc_dir = PathBuf::from(
+        env::var("AWS_LC_BIN_PATH")
+            .unwrap_or_else(|_| build_aws_lc(&build_config).display().to_string()),
+    );
 
-        cmake_cfg.build_target("clean").build();
-        let mut output_dir = cmake_cfg.build_target("ssl").build();
-
-        let libcrypto_path = CRYPTO.locate(&output_dir, build_config.lib_type);
-
-        let mut symbols = HashSet::new();
-        parse_static_symbols(&libcrypto_path, &mut symbols);
-        eprintln!("Count: {}", symbols.len());
-        let symbol_path = output_dir.join(Path::new("symbols.txt"));
-        write_symbol_file(&symbol_path, symbols);
-
-        if build_config.prefix {
-            cmake_cfg.build_target("clean").build();
-            let mut cmake_cfg = prepare_cmake_build(
-                build_config.fips,
-                build_config.lib_type,
-                Some((AWS_LC_PREFIX_VALUE, &symbol_path)),
-            );
-            output_dir = cmake_cfg.build_target("ssl").build();
-        }
-
-        output_dir.display().to_string()
-    }));
-    eprintln!("OUTPUT DIR: {}", bssl_dir.to_str().unwrap());
-
-    let mut libcrypto_path = CRYPTO.locate(&bssl_dir, build_config.lib_type);
-    libcrypto_path.pop();
-    let mut libssl_path = SSL.locate(&bssl_dir, build_config.lib_type);
-    libssl_path.pop();
+    let mut libcrypto_path = CRYPTO.locate(&aws_lc_dir, build_config.lib_type);
+    let mut libssl_path = SSL.locate(&aws_lc_dir, build_config.lib_type);
     println!(
         "cargo:rustc-link-search=native={}",
-        libcrypto_path.display().to_string()
+        libcrypto_path.parent().unwrap().display().to_string()
     );
     println!(
         "cargo:rustc-link-search=native={}",
-        libssl_path.display().to_string()
+        libssl_path.parent().unwrap().display().to_string()
+    );
+    println!(
+        "cargo:rustc-link-lib={}=crypto",
+        build_config.lib_type.rust_lib_type()
+    );
+    println!(
+        "cargo:rustc-link-lib={}=ssl",
+        build_config.lib_type.rust_lib_type()
     );
 
-    match build_config.lib_type {
-        DYNAMIC => {
-            println!("cargo:rustc-link-lib=dylib=crypto");
-            println!("cargo:rustc-link-lib=dylib=ssl");
-        }
-        STATIC => {
-            println!("cargo:rustc-link-lib=static=crypto");
-            println!("cargo:rustc-link-lib=static=ssl");
-        }
+    if cfg!(target_os = "macos") {
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-undefined,dynamic_lookup");
     }
 
     //panic!("Stop here");
     println!("cargo:rerun-if-env-changed=AWS_LC_INCLUDE_PATH");
-    let include_path =
-        std::env::var("AWS_LC_INCLUDE_PATH").unwrap_or_else(|_| format!("{}/include", AWS_LC_PATH));
-
-    let mut clang_args = Vec::new();
-    clang_args.push("-I");
-    clang_args.push(&include_path);
-    let boring_prefix_param = &format!("-DBORINGSSL_PREFIX={}", AWS_LC_PREFIX_VALUE);
-    clang_args.push(&boring_prefix_param);
-    clang_args.push("-I");
-    let symbol_include_dir = bssl_dir
-        .join("build")
-        .join("symbol_prefix_include")
-        .display()
-        .to_string();
-    clang_args.push(&symbol_include_dir);
+    let clang_args;
+    if build_config.prefix {
+        clang_args = prepare_clang_args(Some((&prefix_string(), &aws_lc_dir)));
+    } else {
+        clang_args = prepare_clang_args(None);
+    }
 
     let mut builder = bindgen::Builder::default()
         .derive_copy(true)
@@ -530,13 +582,13 @@ fn main() {
         .layout_tests(true)
         .prepend_enum_name(true)
         .rustfmt_bindings(true)
-        //.ctypes_prefix(AWS_LC_PREFIX_VALUE)
-        .clang_args(&clang_args);
+        .clang_args(&clang_args)
+        .header("wrapper.h");
 
-    let headers = ["wrapper.h"];
-    for header in &headers {
-        builder = builder.header("wrapper.h");
+    if build_config.prefix {
+        builder = builder.parse_callbacks(Box::new(SymbolCallback::new()))
     }
+
 
     let bindings = builder.generate().expect("Unable to generate bindings");
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
