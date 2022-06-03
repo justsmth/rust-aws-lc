@@ -237,7 +237,7 @@ fn verify_fips_clang_version() -> (&'static str, &'static str) {
 
 struct BuildConfig {
     link_from: Option<PathBuf>,
-    prefix: bool,
+    prefix: Option<String>,
     fips: bool,
     lib_type: OutputLibType,
 }
@@ -255,7 +255,7 @@ impl BuildConfig {
             Dynamic
         };
         let mut fips = false;
-        let prefix = true;
+        let use_prefix = true;
 
         if cfg!(feature = "fips") {
             if cfg!(target_os = "macos") {
@@ -268,6 +268,12 @@ impl BuildConfig {
         } else if cfg!(feature = "static") {
             lib_type = Static;
         }
+
+        let prefix = if use_prefix {
+            Some(prefix_string())
+        } else {
+            None
+        };
 
         BuildConfig {
             link_from,
@@ -417,21 +423,32 @@ impl OutputLibType {
 }
 
 impl OutputLib {
-    fn libname(&self) -> &str {
-        match self {
-            Crypto => "crypto",
-            Ssl => "ssl",
-        }
+    fn libname(&self, prefix: &Option<String>) -> String {
+        format!(
+            "{}{}",
+            if let Some(pfix) = prefix.to_owned() {
+                pfix
+            } else {
+                "".to_string()
+            },
+            match self {
+                Crypto => "crypto",
+                Ssl => "ssl",
+            }
+        )
     }
 
-    fn locate(&self, path: &Path, lib_type: OutputLibType) -> PathBuf {
-        path.join(Path::new(&format!("build/{}", self.libname())))
+    fn locate_dir(&self, path: &Path) -> PathBuf {
+        path.join(Path::new(&format!("build/{}", self.libname(&None))))
             .join(get_boringssl_platform_output_path())
-            .join(Path::new(&format!(
-                "lib{}.{}",
-                self.libname(),
-                lib_type.file_extension()
-            )))
+    }
+
+    fn locate(&self, path: &Path, lib_type: OutputLibType, prefix: &Option<String>) -> PathBuf {
+        self.locate_dir(path).join(Path::new(&format!(
+            "lib{}.{}",
+            self.libname(prefix),
+            lib_type.file_extension()
+        )))
     }
 }
 
@@ -441,11 +458,17 @@ fn build_aws_lc(build_config: &BuildConfig) -> Result<PathBuf, String> {
     cmake_cfg.build_target("clean").build();
     let mut output_dir = cmake_cfg.build_target("ssl").build();
 
-    if build_config.prefix {
+    if build_config.prefix.is_some() {
         let mut symbols = HashSet::new();
 
-        let libcrypto_path = Crypto.locate(&output_dir, build_config.lib_type);
-        parse_static_symbols(&libcrypto_path, &mut symbols)?;
+        let libcrypto_path = Crypto.locate(&output_dir, build_config.lib_type, &None);
+        let libssl_path = Ssl.locate(&output_dir, build_config.lib_type, &None);
+        if let Static = build_config.lib_type {
+            parse_static_symbols(&libcrypto_path, &mut symbols)?;
+            parse_static_symbols(&libssl_path, &mut symbols)?;
+        } else {
+            panic!("Dynamic libraries not yet supported");
+        }
 
         let symbol_path = output_dir.join(Path::new("symbols.txt"));
         write_symbol_file(&symbol_path, symbols).map_err(|err| err.to_string())?;
@@ -455,9 +478,17 @@ fn build_aws_lc(build_config: &BuildConfig) -> Result<PathBuf, String> {
         let mut cmake_cfg = prepare_cmake_build(
             build_config.fips,
             build_config.lib_type,
-            Some((&prefix_string(), &symbol_path)),
+            Some((&build_config.prefix.to_owned().unwrap(), &symbol_path)),
         );
         output_dir = cmake_cfg.build_target("ssl").build();
+
+        let libcrypto_prefix_path =
+            Crypto.locate(&output_dir, build_config.lib_type, &build_config.prefix);
+        let libssl_prefix_path =
+            Ssl.locate(&output_dir, build_config.lib_type, &build_config.prefix);
+
+        std::fs::rename(libcrypto_path, libcrypto_prefix_path).map_err(|err| err.to_string())?;
+        std::fs::rename(libssl_path, libssl_prefix_path).map_err(|err| err.to_string())?;
     }
 
     Ok(output_dir)
@@ -525,33 +556,32 @@ fn main() {
         .to_owned()
         .unwrap_or_else(|| build_aws_lc(&build_config).unwrap());
 
-    let libcrypto_path = Crypto.locate(&aws_lc_dir, build_config.lib_type);
-    let libssl_path = Ssl.locate(&aws_lc_dir, build_config.lib_type);
+    let libcrypto_dir = Crypto.locate_dir(&aws_lc_dir);
+    let libssl_dir = Ssl.locate_dir(&aws_lc_dir);
+    println!("cargo:rustc-link-search=native={}", libcrypto_dir.display());
+    println!("cargo:rustc-link-search=native={}", libssl_dir.display());
     println!(
-        "cargo:rustc-link-search=native={}",
-        libcrypto_path.parent().unwrap().display()
+        "cargo:rustc-link-lib={}={}",
+        build_config.lib_type.rust_lib_type(),
+        Crypto.libname(&build_config.prefix)
     );
     println!(
-        "cargo:rustc-link-search=native={}",
-        libssl_path.parent().unwrap().display()
-    );
-    println!(
-        "cargo:rustc-link-lib={}=crypto",
-        build_config.lib_type.rust_lib_type()
-    );
-    println!(
-        "cargo:rustc-link-lib={}=ssl",
-        build_config.lib_type.rust_lib_type()
+        "cargo:rustc-link-lib={}={}",
+        build_config.lib_type.rust_lib_type(),
+        Ssl.libname(&build_config.prefix)
     );
 
-    if cfg!(target_os = "macos") {
+    if cfg!(target_os = "macos") && build_config.lib_type == Dynamic {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-undefined,dynamic_lookup");
     }
 
     //panic!("Stop here");
     println!("cargo:rerun-if-env-changed=AWS_LC_INCLUDE_PATH");
-    let clang_args = if build_config.prefix {
-        prepare_clang_args(Some((&prefix_string(), &aws_lc_dir)))
+    let clang_args = if build_config.prefix.is_some() {
+        prepare_clang_args(Some((
+            &build_config.prefix.to_owned().unwrap(),
+            &aws_lc_dir,
+        )))
     } else {
         prepare_clang_args(None)
     };
@@ -572,7 +602,7 @@ fn main() {
         .clang_args(&clang_args)
         .header("wrapper.h");
 
-    if build_config.prefix {
+    if build_config.prefix.is_some() {
         builder = builder.parse_callbacks(Box::new(SymbolCallback::new()))
     }
 
