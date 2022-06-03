@@ -1,20 +1,14 @@
-use crate::OutputLib::{CRYPTO, SSL};
-use crate::OutputLibType::{DYNAMIC, STATIC};
-use bindgen::callbacks::{
-    DeriveTrait, EnumVariantCustomBehavior, EnumVariantValue, IntKind, MacroParsingBehavior,
-};
+use crate::OutputLib::{Crypto, Ssl};
+use crate::OutputLibType::{Dynamic, Static};
 use cmake::Config;
 use macho::{MachObject, SymTabType, SymTabTypeMask, SymbolTableEntry};
-use std::cell::RefCell;
 use std::collections::HashSet;
-use std::convert::TryInto;
 use std::env;
-use std::fmt::{Debug, Formatter};
+use std::fmt::Debug;
 use std::fs::File;
-use std::io::{Cursor, Error, Read, Seek, SeekFrom, Write};
+use std::io::{Error, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 
 // NOTE: this build script is adopted from quiche (https://github.com/cloudflare/quiche)
 
@@ -73,7 +67,7 @@ const CMAKE_PARAMS_IOS: &[(&str, &[(&str, &str)])] = &[
 fn get_boringssl_platform_output_path() -> PathBuf {
     if cfg!(windows) {
         // Code under this branch should match the logic in cmake-rs
-        let debug_env_var = std::env::var("DEBUG").expect("DEBUG variable not defined in env");
+        let debug_env_var = env::var("DEBUG").expect("DEBUG variable not defined in env");
 
         let deb_info = match &debug_env_var[..] {
             "false" => false,
@@ -81,8 +75,7 @@ fn get_boringssl_platform_output_path() -> PathBuf {
             unknown => panic!("Unknown DEBUG={} env var.", unknown),
         };
 
-        let opt_env_var =
-            std::env::var("OPT_LEVEL").expect("OPT_LEVEL variable not defined in env");
+        let opt_env_var = env::var("OPT_LEVEL").expect("OPT_LEVEL variable not defined in env");
 
         let subdir = match &opt_env_var[..] {
             "0" => "Debug",
@@ -111,12 +104,12 @@ const AWS_LC_PATH: &str = "deps/aws-lc";
 /// Returns a new cmake::Config for building BoringSSL.
 ///
 /// It will add platform-specific parameters if needed.
-fn get_boringssl_cmake_config() -> cmake::Config {
-    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
-    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
-    let pwd = std::env::current_dir().unwrap();
+fn get_boringssl_cmake_config() -> Config {
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let pwd = env::current_dir().unwrap();
 
-    let mut boringssl_cmake = cmake::Config::new(AWS_LC_PATH);
+    let mut boringssl_cmake = Config::new(AWS_LC_PATH);
 
     // Add platform-specific parameters.
     match os.as_ref() {
@@ -129,9 +122,9 @@ fn get_boringssl_cmake_config() -> cmake::Config {
 
             // We need ANDROID_NDK_HOME to be set properly.
             println!("cargo:rerun-if-env-changed=ANDROID_NDK_HOME");
-            let android_ndk_home = std::env::var("ANDROID_NDK_HOME")
+            let android_ndk_home = env::var("ANDROID_NDK_HOME")
                 .expect("Please set ANDROID_NDK_HOME for Android build");
-            let android_ndk_home = std::path::Path::new(&android_ndk_home);
+            let android_ndk_home = Path::new(&android_ndk_home);
             for (android_arch, params) in cmake_params_android {
                 if *android_arch == arch {
                     for (name, value) in *params {
@@ -186,7 +179,7 @@ fn get_boringssl_cmake_config() -> cmake::Config {
                 boringssl_cmake.define(
                     "CMAKE_TOOLCHAIN_FILE",
                     pwd.join(AWS_LC_PATH)
-                        .join("src/util/32-bit-toolchain.cmake")
+                        .join("util/32-bit-toolchain.cmake")
                         .as_os_str(),
                 );
             }
@@ -257,9 +250,9 @@ impl BuildConfig {
         };
         // Default to static build only on Mac
         let mut lib_type = if cfg!(target_os = "macos") {
-            STATIC
+            Static
         } else {
-            DYNAMIC
+            Dynamic
         };
         let mut fips = false;
         let prefix = true;
@@ -269,11 +262,11 @@ impl BuildConfig {
                 panic!("FIPS is not currently supported on MacOS");
             }
             fips = true;
-            lib_type = DYNAMIC;
+            lib_type = Dynamic;
         } else if cfg!(feature = "dynamic") {
-            lib_type = DYNAMIC;
+            lib_type = Dynamic;
         } else if cfg!(feature = "static") {
-            lib_type = STATIC;
+            lib_type = Static;
         }
 
         BuildConfig {
@@ -310,11 +303,9 @@ fn prepare_cmake_build(
         cfg.define("CMAKE_ASM_COMPILER", clang);
         cfg.define("FIPS", "1");
     }
-    match lib_type {
-        DYNAMIC => {
-            cfg.define("BUILD_SHARED_LIBS", "TRUE");
-        }
-        _ => {}
+
+    if let Dynamic = lib_type {
+        cfg.define("BUILD_SHARED_LIBS", "TRUE");
     }
     if let Some((symbol_prefix, symbol_file_path)) = build_prefix {
         cfg.define("BORINGSSL_PREFIX", symbol_prefix);
@@ -335,8 +326,7 @@ impl LinkerSymbol for SymbolTableEntry {
     fn is_public(&self, lib_type: OutputLibType) -> bool {
         (self.n_type & SymTabTypeMask::N_TYPE as u8) != SymTabType::N_UNDF as u8
             && (self.n_type & SymTabTypeMask::N_EXT as u8) != 0
-            && (lib_type == OutputLibType::STATIC
-                || (self.n_type & SymTabTypeMask::N_PEXT as u8) == 0)
+            && (lib_type == Static || (self.n_type & SymTabTypeMask::N_PEXT as u8) == 0)
     }
 }
 
@@ -353,10 +343,14 @@ fn parse_mach_o_object(
                 if let Some("_") = entry.symbol.get(0..1) {
                     symbols.insert(String::from(entry.symbol.get(1..).unwrap()));
                 } else {
+                    // TODO: This should be an error once AWS-LC's "bignum" assembly code
+                    // no longer generates such symbols
+                    /*
                     return Err(format!(
                         "Unexpected symbol without underscore prefix: {}",
                         entry.symbol
                     ));
+                    */
                 }
             }
         }
@@ -367,19 +361,15 @@ fn parse_mach_o_object(
 
 fn parse_static_symbols(path: &PathBuf, symbols: &mut HashSet<String>) -> Result<(), String> {
     use ar::Archive;
-    use std::fs::File;
-    use std::io;
-    use std::str;
 
     let mut archive = Archive::new(File::open(path).unwrap());
     while let Some(entry_result) = archive.next_entry() {
         let mut entry = entry_result.unwrap();
-        let name = String::from_utf8_lossy(entry.header().identifier());
         entry.header().size();
 
         let mut buffer = Vec::new();
         entry.read_to_end(&mut buffer).unwrap();
-        parse_mach_o_object(&buffer, STATIC, symbols)?;
+        parse_mach_o_object(&buffer, Static, symbols)?;
     }
     Ok(())
 }
@@ -391,8 +381,8 @@ fn write_symbol_file(path: &PathBuf, symbols: HashSet<String>) -> Result<usize, 
     symbol_list.sort();
     for symbol in symbol_list {
         if !symbol.contains("bignum") {
-            file.write(symbol.as_bytes())?;
-            file.write("\n".as_bytes())?;
+            let _ = file.write(symbol.as_bytes())?;
+            let _ = file.write("\n".as_bytes())?;
             counter += 1;
         }
     }
@@ -401,27 +391,27 @@ fn write_symbol_file(path: &PathBuf, symbols: HashSet<String>) -> Result<usize, 
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OutputLib {
-    CRYPTO,
-    SSL,
+    Crypto,
+    Ssl,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OutputLibType {
-    STATIC,
-    DYNAMIC,
+    Static,
+    Dynamic,
 }
 
 impl OutputLibType {
     fn file_extension(&self) -> &str {
         match self {
-            STATIC => "a",
-            DYNAMIC => "so",
+            Static => "a",
+            Dynamic => "so",
         }
     }
     fn rust_lib_type(&self) -> &str {
         match self {
-            STATIC => "static",
-            DYNAMIC => "dylib",
+            Static => "static",
+            Dynamic => "dylib",
         }
     }
 }
@@ -429,12 +419,12 @@ impl OutputLibType {
 impl OutputLib {
     fn libname(&self) -> &str {
         match self {
-            CRYPTO => "crypto",
-            SSL => "ssl",
+            Crypto => "crypto",
+            Ssl => "ssl",
         }
     }
 
-    fn locate(&self, path: &PathBuf, lib_type: OutputLibType) -> PathBuf {
+    fn locate(&self, path: &Path, lib_type: OutputLibType) -> PathBuf {
         path.join(Path::new(&format!("build/{}", self.libname())))
             .join(get_boringssl_platform_output_path())
             .join(Path::new(&format!(
@@ -445,7 +435,7 @@ impl OutputLib {
     }
 }
 
-fn build_aws_lc(build_config: &BuildConfig) -> PathBuf {
+fn build_aws_lc(build_config: &BuildConfig) -> Result<PathBuf, String> {
     let mut cmake_cfg = prepare_cmake_build(build_config.fips, build_config.lib_type, None);
 
     cmake_cfg.build_target("clean").build();
@@ -454,11 +444,11 @@ fn build_aws_lc(build_config: &BuildConfig) -> PathBuf {
     if build_config.prefix {
         let mut symbols = HashSet::new();
 
-        let libcrypto_path = CRYPTO.locate(&output_dir, build_config.lib_type);
-        parse_static_symbols(&libcrypto_path, &mut symbols);
+        let libcrypto_path = Crypto.locate(&output_dir, build_config.lib_type);
+        parse_static_symbols(&libcrypto_path, &mut symbols)?;
 
         let symbol_path = output_dir.join(Path::new("symbols.txt"));
-        write_symbol_file(&symbol_path, symbols);
+        write_symbol_file(&symbol_path, symbols).map_err(|err| err.to_string())?;
 
         cmake_cfg.build_target("clean").build();
 
@@ -470,13 +460,13 @@ fn build_aws_lc(build_config: &BuildConfig) -> PathBuf {
         output_dir = cmake_cfg.build_target("ssl").build();
     }
 
-    output_dir
+    Ok(output_dir)
 }
 
 //TODO:
-const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 fn prefix_string() -> String {
-    format!("aws_lc_{}", VERSION.to_string().replace(".", "_"))
+    format!("aws_lc_{}", VERSION.to_string().replace('.', "_"))
 }
 
 fn prepare_clang_args(build_prefix: Option<(&str, &PathBuf)>) -> Vec<String> {
@@ -527,25 +517,23 @@ impl bindgen::callbacks::ParseCallbacks for SymbolCallback {
 }
 
 fn main() {
-    use std::env;
-
     let build_config = BuildConfig::create();
 
     println!("cargo:rerun-if-env-changed=AWS_LC_BIN_PATH");
-    let mut aws_lc_dir = PathBuf::from(
-        env::var("AWS_LC_BIN_PATH")
-            .unwrap_or_else(|_| build_aws_lc(&build_config).display().to_string()),
-    );
+    let aws_lc_dir = build_config
+        .link_from
+        .to_owned()
+        .unwrap_or_else(|| build_aws_lc(&build_config).unwrap());
 
-    let mut libcrypto_path = CRYPTO.locate(&aws_lc_dir, build_config.lib_type);
-    let mut libssl_path = SSL.locate(&aws_lc_dir, build_config.lib_type);
+    let libcrypto_path = Crypto.locate(&aws_lc_dir, build_config.lib_type);
+    let libssl_path = Ssl.locate(&aws_lc_dir, build_config.lib_type);
     println!(
         "cargo:rustc-link-search=native={}",
-        libcrypto_path.parent().unwrap().display().to_string()
+        libcrypto_path.parent().unwrap().display()
     );
     println!(
         "cargo:rustc-link-search=native={}",
-        libssl_path.parent().unwrap().display().to_string()
+        libssl_path.parent().unwrap().display()
     );
     println!(
         "cargo:rustc-link-lib={}=crypto",
@@ -562,12 +550,11 @@ fn main() {
 
     //panic!("Stop here");
     println!("cargo:rerun-if-env-changed=AWS_LC_INCLUDE_PATH");
-    let clang_args;
-    if build_config.prefix {
-        clang_args = prepare_clang_args(Some((&prefix_string(), &aws_lc_dir)));
+    let clang_args = if build_config.prefix {
+        prepare_clang_args(Some((&prefix_string(), &aws_lc_dir)))
     } else {
-        clang_args = prepare_clang_args(None);
-    }
+        prepare_clang_args(None)
+    };
 
     let mut builder = bindgen::Builder::default()
         .derive_copy(true)
@@ -588,7 +575,6 @@ fn main() {
     if build_config.prefix {
         builder = builder.parse_callbacks(Box::new(SymbolCallback::new()))
     }
-
 
     let bindings = builder.generate().expect("Unable to generate bindings");
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
