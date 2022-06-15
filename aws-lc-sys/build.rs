@@ -536,7 +536,7 @@ impl SymbolCallback {
 }
 
 impl bindgen::callbacks::ParseCallbacks for SymbolCallback {
-    fn link_name_override(&self, function_name: &str) -> Option<String> {
+    fn generated_name_override(&self, function_name: &str) -> Option<String> {
         let mut result = function_name.to_string();
         if result.starts_with(&self.prefix) {
             result = result.replace(&self.prefix, "");
