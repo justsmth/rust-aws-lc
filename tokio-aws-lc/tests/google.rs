@@ -8,8 +8,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_aws_lc::{HandshakeError, SslStream};
 
 #[tokio::test]
+#[cfg_attr(target_os = "macos", ignore)]
 async fn google() {
     let addr = "google.com:443".to_socket_addrs().unwrap().next().unwrap();
+    // TODO: Why does the following line hang on Mac?
     let stream = TcpStream::connect(&addr).await.unwrap();
 
     let config = SslConnector::builder(SslMethod::tls())
